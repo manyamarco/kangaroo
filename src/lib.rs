@@ -6,6 +6,7 @@
 //! Supports AMD, NVIDIA, Intel GPUs via wgpu (Vulkan/Metal/DX12).
 
 mod benchmark;
+mod checkpoint;
 mod cli;
 mod convert;
 mod cpu;
@@ -26,6 +27,7 @@ pub use modular::ModConstraint;
 pub use solver::KangarooSolver;
 
 use anyhow::anyhow;
+use checkpoint::{load_checkpoint, save_checkpoint, CheckpointData};
 use clap::Parser;
 use indicatif::ProgressBar;
 use k256::elliptic_curve::ops::Reduce;
@@ -127,6 +129,18 @@ pub struct Args {
     /// Modular residue (hex): class residue for constraint (0 ≤ R < M) [e.g. 25 = 37]
     #[arg(long, default_value = "0")]
     mod_start: String,
+
+    /// Path to checkpoint file for autosave/restore (default: kangaroo.checkpoint)
+    #[arg(long, default_value = "kangaroo.checkpoint")]
+    checkpoint: PathBuf,
+
+    /// Autosave interval in seconds (default: 300 = 5 minutes)
+    #[arg(long, default_value = "300")]
+    checkpoint_interval: u64,
+
+    /// Disable checkpoint autosave and restore
+    #[arg(long)]
+    no_checkpoint: bool,
 }
 
 #[derive(Serialize)]
@@ -755,6 +769,9 @@ fn run_single_gpu_solver(
     effective_range: u32,
     constraint: &Option<ModConstraint>,
     gpu_context: gpu_crypto::GpuContext,
+    pubkey_str: &str,
+    start_str: &str,
+    stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let device_name = gpu_context.device_name().to_string();
     if !args.quiet && !args.json {
@@ -817,6 +834,31 @@ fn run_single_gpu_solver(
         pb
     };
 
+    // --- Checkpoint restore ---
+    if !args.no_checkpoint && args.checkpoint.exists() {
+        match load_checkpoint(&args.checkpoint) {
+            Ok(ref cp) if cp.matches(pubkey_str, start_str, range_bits) => {
+                let restored = solver.restore_from_checkpoint(cp);
+                if !args.quiet && !args.json {
+                    info!(
+                        "Checkpoint restored: {} DPs loaded (previous ops: {})",
+                        restored, cp.total_ops
+                    );
+                }
+            }
+            Ok(_) => {
+                if !args.quiet && !args.json {
+                    info!("Checkpoint skipped: parameters do not match current search");
+                }
+            }
+            Err(e) => {
+                if !args.quiet && !args.json {
+                    info!("Checkpoint not loaded: {}", e);
+                }
+            }
+        }
+    }
+
     if !args.quiet && !args.json {
         info!("Starting search...");
     }
@@ -827,12 +869,46 @@ fn run_single_gpu_solver(
         args.max_ops
     };
 
+    let checkpoint_interval = Duration::from_secs(args.checkpoint_interval);
+    let mut last_checkpoint = Instant::now();
+
     let start_time = Instant::now();
 
     loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            // Ctrl+C received — save checkpoint before exiting
+            if !args.no_checkpoint {
+                let total_ops = solver.total_operations();
+                if let Some(table) = solver.dp_table() {
+                    let cp = CheckpointData::new(pubkey_str, start_str, range_bits, total_ops, table);
+                    if save_checkpoint(&args.checkpoint, &cp).is_ok() && !args.quiet && !args.json {
+                        info!("Checkpoint saved on exit ({} DPs)", cp.entry_count());
+                    }
+                }
+            }
+            return Err(anyhow!("Interrupted"));
+        }
+
         let result = solver.step()?;
         let total_ops = solver.total_operations();
         pb.set_position(total_ops);
+
+        // --- Periodic checkpoint save ---
+        if !args.no_checkpoint && last_checkpoint.elapsed() >= checkpoint_interval {
+            if let Some(table) = solver.dp_table() {
+                let cp = CheckpointData::new(pubkey_str, start_str, range_bits, total_ops, table);
+                match save_checkpoint(&args.checkpoint, &cp) {
+                    Ok(()) if !args.quiet && !args.json => {
+                        info!("Checkpoint saved ({} DPs, {} ops)", cp.entry_count(), total_ops);
+                    }
+                    Err(e) if !args.quiet && !args.json => {
+                        tracing::warn!("Failed to save checkpoint: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+            last_checkpoint = Instant::now();
+        }
 
         if let Some(j_or_key) = result {
             let private_key = match constraint {
@@ -1104,6 +1180,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    {
+        let sf = Arc::clone(&stop_flag);
+        ctrlc::set_handler(move || {
+            sf.store(true, Ordering::SeqCst);
+        })
+        .ok();
+    }
+
     if uses_direct_default_gpu_path(&args.gpu, args.include_integrated) {
         let gpu_context = pollster::block_on(gpu_crypto::GpuContext::new_from_global_index(
             0,
@@ -1117,6 +1202,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             effective_range,
             &constraint,
             gpu_context,
+            &params.pubkey_str,
+            &params.start_str,
+            Arc::clone(&stop_flag),
         );
     }
 
@@ -1145,6 +1233,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             effective_range,
             &constraint,
             gpu_context,
+            &params.pubkey_str,
+            &params.start_str,
+            Arc::clone(&stop_flag),
         );
     }
 
@@ -1310,7 +1401,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let queue_capacity = (solvers.len() * 2).max(1);
     let (tx, rx) = mpsc::sync_channel::<Vec<gpu::GpuDistinguishedPoint>>(queue_capacity);
-    let stop_flag = Arc::new(AtomicBool::new(false));
     let total_ops = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(solvers.len());
@@ -1352,8 +1442,36 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     drop(tx);
 
     let mut dp_table = cpu::DPTable::new(solve_start, solve_pubkey, solve_base_point);
+
+    // --- Checkpoint restore (multi-GPU) ---
+    if !args.no_checkpoint && args.checkpoint.exists() {
+        match load_checkpoint(&args.checkpoint) {
+            Ok(ref cp) if cp.matches(&params.pubkey_str, &params.start_str, range_bits) => {
+                let restored = cp.restore_into(&mut dp_table);
+                if !args.quiet && !args.json {
+                    info!(
+                        "Checkpoint restored: {} DPs loaded (previous ops: {})",
+                        restored, cp.total_ops
+                    );
+                }
+            }
+            Ok(_) => {
+                if !args.quiet && !args.json {
+                    info!("Checkpoint skipped: parameters do not match current search");
+                }
+            }
+            Err(e) => {
+                if !args.quiet && !args.json {
+                    info!("Checkpoint not loaded: {}", e);
+                }
+            }
+        }
+    }
+
     let mut found_key: Option<Vec<u8>> = None;
 
+    let checkpoint_interval = Duration::from_secs(args.checkpoint_interval);
+    let mut last_checkpoint = Instant::now();
     let mut last_log_ops: u64 = 0;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -1401,8 +1519,50 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             );
         }
 
-        if current_ops >= max_ops {
-            stop_flag.store(true, Ordering::Relaxed);
+        // Periodic checkpoint save
+        if !args.no_checkpoint && last_checkpoint.elapsed() >= checkpoint_interval {
+            let cp = CheckpointData::new(
+                &params.pubkey_str,
+                &params.start_str,
+                range_bits,
+                current_ops,
+                &dp_table,
+            );
+            match save_checkpoint(&args.checkpoint, &cp) {
+                Ok(()) if !args.quiet && !args.json => {
+                    info!(
+                        "Checkpoint saved ({} DPs, {} ops)",
+                        cp.entry_count(),
+                        current_ops
+                    );
+                }
+                Err(e) if !args.quiet && !args.json => {
+                    tracing::warn!("Failed to save checkpoint: {}", e);
+                }
+                _ => {}
+            }
+            last_checkpoint = Instant::now();
+        }
+
+        if current_ops >= max_ops || stop_flag.load(Ordering::Relaxed) {
+            if stop_flag.load(Ordering::Relaxed) && found_key.is_none() {
+                // Ctrl+C — save checkpoint before exiting
+                if !args.no_checkpoint {
+                    let cp = CheckpointData::new(
+                        &params.pubkey_str,
+                        &params.start_str,
+                        range_bits,
+                        current_ops,
+                        &dp_table,
+                    );
+                    if save_checkpoint(&args.checkpoint, &cp).is_ok() && !args.quiet && !args.json {
+                        info!("Checkpoint saved on exit ({} DPs)", cp.entry_count());
+                    }
+                }
+            }
+            if current_ops >= max_ops {
+                stop_flag.store(true, Ordering::Relaxed);
+            }
             break;
         }
     }

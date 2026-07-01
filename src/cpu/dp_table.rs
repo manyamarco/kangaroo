@@ -196,6 +196,38 @@ impl DPTable {
         (self.tame_count, self.wild1_count, self.wild2_count)
     }
 
+    /// Export all stored DPs as (affine_x BE, dist LE, ktype) tuples.
+    pub fn export_entries(&self) -> Vec<([u8; 32], [u8; 32], u32)> {
+        self.table
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|e| (e.affine_x, e.dist, e.ktype))
+            .collect()
+    }
+
+    /// Directly insert a DP without collision detection (used for checkpoint restore).
+    pub fn import_entry(&mut self, affine_x: [u8; 32], dist: [u8; 32], ktype: u32) {
+        if self.total_dps >= MAX_DISTINGUISHED_POINTS {
+            return;
+        }
+        let hash_key = u64::from_le_bytes([
+            affine_x[0],
+            affine_x[1],
+            affine_x[2],
+            affine_x[3],
+            affine_x[4],
+            affine_x[5],
+            affine_x[6],
+            affine_x[7],
+        ]);
+        self.table
+            .entry(hash_key)
+            .or_default()
+            .push(StoredDP { affine_x, dist, ktype });
+        self.total_dps += 1;
+        self.increment_type_counter(ktype);
+    }
+
     fn increment_type_counter(&mut self, ktype: u32) {
         match ktype {
             0 => self.tame_count += 1,

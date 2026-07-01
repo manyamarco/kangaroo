@@ -513,6 +513,19 @@ impl KangarooSolver {
         self.total_ops
     }
 
+    pub fn dp_table(&self) -> Option<&DPTable> {
+        self.dp_table.as_ref()
+    }
+
+    /// Restore distinguished points from a checkpoint into the internal DPTable.
+    pub fn restore_from_checkpoint(&mut self, cp: &crate::checkpoint::CheckpointData) -> usize {
+        if let Some(ref mut table) = self.dp_table {
+            cp.restore_into(table)
+        } else {
+            0
+        }
+    }
+
     fn read_slot_dp_count(&self, slot: usize, submission: wgpu::SubmissionIndex) -> Result<u32> {
         let staging = self.buffers.staging_buffer(slot);
         let slice = staging.slice(0..4);
